@@ -18,45 +18,89 @@ const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // Try Longhorn API first (fast & reliable)
 async function tryLonghorn() {
   const url = 'https://mobile.longhorn.luse.co.zm/api/securities';
+  const MAX_ATTEMPTS = 4;
+  const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
+      // progressive backoff for retries (250ms, 500ms, 1000ms, ...)
+      if (attempt > 1) {
+        const waitMs = 250 * Math.pow(2, attempt - 2);
+        console.log(`Longhorn: waiting ${waitMs}ms before attempt ${attempt}`);
+        await new Promise(res => setTimeout(res, waitMs));
+      }
+
+      console.log(`Longhorn: attempt ${attempt} fetching ${url}`);
       const r = await fetch(url, {
         headers: {
           'User-Agent': USER_AGENT,
-          'Accept': 'application/json',
+          'Accept': 'application/json, text/plain, */*',
           'Accept-Language': 'en-US,en;q=0.9',
-          'Connection': 'keep-alive'
+          'Referer': 'https://mobile.longhorn.luse.co.zm/',
+          'Origin': 'https://mobile.longhorn.luse.co.zm',
+          'Connection': 'keep-alive',
+          // some servers respond better if a realistic Accept header is supplied
         },
-        timeout: 20000
+        // node-fetch v2 timeout in ms
+        timeout: 25000
       });
 
-      if (r.ok) {
-        const j = await r.json();
-        const rows = [['Ticker','Company','Last','Bid','Ask']];
+      console.log(`Longhorn: attempt ${attempt} status ${r.status}`);
 
-        j.forEach(it => {
-          rows.push([
-            it.ticker || '',
-            it.securityName || '',
-            Number(it.lastPrice) || '',
-            Number(it.bid) || '',
-            Number(it.ask) || ''
-          ]);
-        });
-
-        return rows;
+      if (!r.ok) {
+        // non-200 — log and retry
+        console.log(`Longhorn: non-ok status ${r.status}, text preview: ${await r.text().then(t=>t.substring(0,200)).catch(()=>'<no body>')}`);
+        continue;
       }
 
-      console.log(`Longhorn attempt ${attempt} failed, status: ${r.status}`);
+      // parse JSON (Longhorn returns JSON)
+      let j;
+      try {
+        j = await r.json();
+      } catch (err) {
+        console.log('Longhorn: JSON parse error:', err.message);
+        continue;
+      }
+
+      // Build rows in the expected table format
+      const rows = [['Ticker','Company','Last','Bid','Ask']];
+      if (!Array.isArray(j) || j.length === 0) {
+        console.log('Longhorn: returned empty array or invalid JSON; falling back');
+        continue;
+      }
+
+      j.forEach(it => {
+        try {
+          const ticker = (it.ticker || '').toString();
+          const company = (it.securityName || it.name || '').toString();
+          const last = (typeof it.lastPrice === 'number') ? it.lastPrice : Number(it.lastPrice) || '';
+          const bid = (typeof it.bid === 'number') ? it.bid : Number(it.bid) || '';
+          const ask = (typeof it.ask === 'number') ? it.ask : Number(it.ask) || '';
+          rows.push([ticker, company, last, bid, ask]);
+        } catch (e) {
+          // continue building rows even if a single item fails
+          console.log('Longhorn: row parse error for item:', e.message);
+        }
+      });
+
+      // If we have at least header + one data row, return it
+      if (rows.length > 1) {
+        console.log(`Longhorn: success on attempt ${attempt}, rows=${rows.length - 1}`);
+        return rows;
+      } else {
+        console.log('Longhorn: no rows parsed - retrying');
+      }
 
     } catch (err) {
-      console.log(`Longhorn attempt ${attempt} error:`, err.message);
+      // network or other unexpected error — log and retry
+      console.log(`Longhorn: attempt ${attempt} error:`, err.message || err);
     }
   }
 
-  throw new Error("Longhorn unreachable after 3 attempts");
+  // If we reach here, Longhorn was unreachable — throw to allow fallback logic upstream
+  throw new Error("Longhorn unreachable after multiple attempts");
 }
+
 
 
 // Fallback – scrape LuSE site (only if Longhorn is down)
