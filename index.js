@@ -1,160 +1,179 @@
-// index.js - LuSE Market Data scraper API (Full data)
-// Deploy on Render (or similar). Exposes /prices/table returning table-format JSON.
+/**
+ * LuSE Market Data API – Auto-detect JSON source
+ * Primary: Try LuSE JSON endpoints
+ * Secondary: Try Longhorn JSON
+ * Final: Fallback table
+ */
 
-const express = require('express');
-const got = require('got');
-const cheerio = require('cheerio');
+const express = require("express");
+const got = require("got");
+const cheerio = require("cheerio");
 
 const app = express();
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = process.env.PORT || 3000;
 
-// Cache (short TTL to avoid hitting LuSE too often)
-const CACHE_TTL = 60 * 1000; // 60 seconds
+// Cache (1 minute)
+const CACHE_TTL = 60000;
 let cache = { ts: 0, rows: null };
 
-// Headers to mimic a real browser
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-// fallback minimal table if scraping fails
+// Final fallback
 const FALLBACK = [
   ["Ticker","Company","Last","Bid","Ask","Change","Volume","Value"],
   ["AVJN","ZANACO PLC",6.04,"","","+0.00%",0,0],
   ["KODT","CEC PLC",22.68,"","","+0.00%",0,0]
 ];
 
-function getCached() {
-  if (cache.rows && (Date.now() - cache.ts) < CACHE_TTL) return cache.rows;
-  return null;
-}
-function setCached(rows) { cache = { ts: Date.now(), rows }; }
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-function parseNumberStr(s) {
-  if (s === null || s === undefined) return '';
-  const cleaned = s.toString().replace(/[,]/g, '').replace(/[^\d\.\-]/g, '').trim();
-  if (cleaned === '') return '';
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : '';
-}
+// Known LuSE endpoints to probe
+const LUSE_JSON_ENDPOINTS = [
+  "https://www.luse.co.zm/wp-json/luse/v1/market-data",
+  "https://www.luse.co.zm/wp-json/luse/v1/market",
+  "https://www.luse.co.zm/wp-json/market-data",
+  "https://www.luse.co.zm/wp-json/wp/v2/market-data",
+  "https://luse.co.zm/wp-json/luse/v1/market-data"
+];
 
-async function fetchLuSEMarketTable() {
-  // target URL
-  const url = 'https://www.luse.co.zm/trading/market-data/#market';
+// Try multiple LuSE JSON endpoints
+async function tryLuSEJson() {
+  for (const url of LUSE_JSON_ENDPOINTS) {
+    try {
+      const r = await got.get(url, {
+        headers: { "User-Agent": UA },
+        timeout: { request: 10000 }
+      });
 
-  // request options
-  const opts = {
-    headers: {
-      'User-Agent': USER_AGENT,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'br, gzip, deflate',
-      'Connection': 'keep-alive',
-      'Referer': 'https://www.luse.co.zm/'
-    },
-    timeout: { request: 20000 },
-    retry: { limit: 1 }
-  };
+      let json;
+      try { json = JSON.parse(r.body); }
+      catch { continue; }
 
-  const res = await got.get(url, opts);
-  const html = res.body;
-  const $ = cheerio.load(html);
+      if (!json || typeof json !== "object") continue;
 
-  // The page contains the market table(s). We'll try to find the table with the header we expect.
-  // Strategy: find any <table> that has "Company" and "Ticker" or "Last Price" headers.
-  let targetTable = null;
-  $('table').each((i, t) => {
-    const headers = $(t).find('th').map((i, th) => $(th).text().trim().toLowerCase()).get();
-    const hasCompany = headers.some(h => /company|name/.test(h));
-    const hasTicker  = headers.some(h => /ticker|symbol/.test(h));
-    const hasLast    = headers.some(h => /last|last price|price/.test(h));
-    if (hasCompany && hasTicker && hasLast && !targetTable) targetTable = t;
-  });
+      // The JSON may have different structures depending on LuSE.
+      // We normalize multiple known formats.
 
-  // If not found, try first table as fallback
-  if (!targetTable) {
-    targetTable = $('table').first();
-    if (!targetTable || targetTable.length === 0) throw new Error('No table found on LuSE page');
+      let rows = [["Ticker","Company","Last","Bid","Ask","Change","Volume","Value"]];
+
+      // Format 1: array of objects
+      if (Array.isArray(json)) {
+        json.forEach(it => {
+          rows.push([
+            it.ticker || it.symbol || "",
+            it.company || it.name || "",
+            Number(it.last || it.price || "") || "",
+            Number(it.bid || "") || "",
+            Number(it.ask || "") || "",
+            it.change || "",
+            Number(it.volume || "") || "",
+            Number(it.value || it.turnover || "") || ""
+          ]);
+        });
+      }
+
+      // Format 2: json.data
+      if (json.data && Array.isArray(json.data)) {
+        json.data.forEach(it => {
+          rows.push([
+            it.ticker || "",
+            it.company || "",
+            Number(it.last || "") || "",
+            Number(it.bid || "") || "",
+            Number(it.ask || "") || "",
+            it.change || "",
+            Number(it.volume || "") || "",
+            Number(it.value || "") || ""
+          ]);
+        });
+      }
+
+      if (rows.length > 1) return rows;
+
+    } catch (e) {
+      // Try next endpoint
+      continue;
+    }
   }
 
-  // Build rows: we will extract columns by header name mapping
-  const headerCells = $(targetTable).find('th').map((i, th) => $(th).text().trim()).get();
-  const headerKeys = headerCells.map(h => h.toLowerCase());
-
-  // Map headers to our standard columns
-  // We'll try to detect column indices for ticker/company/last/change/volume/value/bid/ask
-  const idx = {
-    ticker: headerKeys.findIndex(h => /ticker|symbol/.test(h)),
-    company: headerKeys.findIndex(h => /company|name/.test(h)),
-    last: headerKeys.findIndex(h => /last|last price|price/.test(h)),
-    change: headerKeys.findIndex(h => /change|%/.test(h)),
-    volume: headerKeys.findIndex(h => /volume/.test(h)),
-    value: headerKeys.findIndex(h => /value|zmw|turnover/.test(h)),
-    bid: headerKeys.findIndex(h => /bid/.test(h)),
-    ask: headerKeys.findIndex(h => /ask/.test(h))
-  };
-
-  // Compose output rows with header row (standard order)
-  const out = [["Ticker","Company","Last","Bid","Ask","Change","Volume","Value"]];
-
-  // iterate rows
-  $(targetTable).find('tbody tr').each((ri, tr) => {
-    const cells = $(tr).find('td').map((ci, td) => $(td).text().trim()).get();
-
-    // helper to safely get by index
-    const val = (i) => (i !== -1 && i < cells.length) ? cells[i] : '';
-
-    const ticker  = val(idx.ticker)  || val(idx.company) || ''; // sometimes ticker in different column
-    const company = val(idx.company) || val(idx.ticker) || '';
-    const lastRaw = val(idx.last);
-    const bidRaw  = val(idx.bid);
-    const askRaw  = val(idx.ask);
-    const change  = val(idx.change) || '';
-    const volumeRaw= val(idx.volume);
-    const valueRaw = val(idx.value);
-
-    const last = parseNumberStr(lastRaw);
-    const bid  = parseNumberStr(bidRaw);
-    const ask  = parseNumberStr(askRaw);
-    const vol  = parseNumberStr(volumeRaw);
-    const valAmt = parseNumberStr(valueRaw);
-
-    out.push([ ticker, company, last, bid, ask, change, vol, valAmt ]);
-  });
-
-  if (out.length <= 1) throw new Error('Parsed table but no data rows');
-
-  return out;
+  throw new Error("No LuSE JSON endpoint succeeded");
 }
 
-// Wrapper: tries LuSE primary, with fallback to small static table
-async function getMarketTableWithFallback() {
-  // use cache
-  const cached = getCached();
-  if (cached) return cached;
-
-  // try primary
+// Longhorn fallback
+async function tryLonghorn() {
   try {
-    const rows = await fetchLuSEMarketTable();
-    setCached(rows);
-    return rows;
-  } catch (err) {
-    console.log('LuSE scrape failed:', err.message || err);
+    const r = await got.get("https://mobile.longhorn.luse.co.zm/api/securities", {
+      headers: { "User-Agent": UA },
+      timeout: { request: 10000 }
+    });
+
+    const j = JSON.parse(r.body);
+    if (!Array.isArray(j)) throw new Error();
+
+    let rows = [["Ticker","Company","Last","Bid","Ask","Change","Volume","Value"]];
+
+    j.forEach(it => {
+      rows.push([
+        it.ticker || "",
+        it.securityName || "",
+        Number(it.lastPrice || "") || "",
+        Number(it.bid || "") || "",
+        Number(it.ask || "") || "",
+        "",
+        "",
+        ""
+      ]);
+    });
+
+    if (rows.length > 1) return rows;
+
+    throw new Error("Longhorn returned no data");
+  } catch {
+    throw new Error("Longhorn failed");
+  }
+}
+
+// Master fetch function
+async function getPrices() {
+  // Cache
+  if (cache.rows && Date.now() - cache.ts < CACHE_TTL) {
+    return cache.rows;
   }
 
-  // if primary fails, keep fallback (guarantee)
-  setCached(FALLBACK);
+  // Primary: LuSE JSON
+  try {
+    const rows = await tryLuSEJson();
+    cache = { ts: Date.now(), rows };
+    return rows;
+  } catch (e) {
+    console.log("LuSE JSON failed:", e.message);
+  }
+
+  // Secondary: Longhorn JSON
+  try {
+    const rows = await tryLonghorn();
+    cache = { ts: Date.now(), rows };
+    return rows;
+  } catch (e) {
+    console.log("Longhorn failed:", e.message);
+  }
+
+  // Final fallback
+  cache = { ts: Date.now(), rows: FALLBACK };
   return FALLBACK;
 }
 
-app.get('/prices/table', async (req, res) => {
+app.get("/prices/table", async (req, res) => {
   try {
-    const rows = await getMarketTableWithFallback();
-    return res.json(rows);
-  } catch (err) {
-    console.error('Server error', err);
-    return res.status(500).json({ error: 'server error' });
+    const rows = await getPrices();
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: "server error" });
   }
 });
 
-app.get('/', (req, res) => res.send('LuSE Market Data API - /prices/table'));
+app.get("/", (req, res) => {
+  res.send("LuSE Market API — use /prices/table");
+});
 
-app.listen(PORT, () => console.log(`LuSE Market Data API listening on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`API listening on port ${PORT}`)
+);
