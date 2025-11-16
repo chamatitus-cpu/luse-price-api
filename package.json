@@ -1,14 +1,13 @@
 {
   "name": "luse-price-api",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "cheerio": "^1.0.0-rc.12",
-    "chrome-aws-lambda": "10.1.0",
-    "puppeteer-core": "10.1.0"
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12"
   }
 }
